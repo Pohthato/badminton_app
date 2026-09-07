@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Coach | OmniCourt</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif'] } } }
+        }
+    </script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+
+    <!-- Navbar -->
+    <nav class="border-b border-slate-800 bg-slate-950/80 backdrop-blur-md">
+        <div class="max-w-5xl mx-auto px-6 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <a href="/" class="flex items-center gap-3 group">
+                    <div class="w-8 h-8 rounded-lg bg-purple-600 flex items-center justify-center shadow-lg shadow-purple-500/30 group-hover:scale-105 transition-transform">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                    </div>
+                    <span class="text-xl font-bold tracking-tight text-white">AI <span class="text-purple-500">Coach</span></span>
+                </a>
+            </div>
+            <a href="/" class="text-sm font-medium text-slate-400 hover:text-white transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                Back to Upload
+            </a>
+        </div>
+    </nav>
+
+    <!-- Main Chat Area -->
+    <main class="flex-1 max-w-4xl mx-auto w-full px-4 py-6 flex flex-col">
+        
+        <!-- Player Selector -->
+        <div class="mb-4">
+            <label class="block text-sm font-medium text-slate-400 mb-2">Select Analyzed Player</label>
+            <select id="playerSelect" class="w-full bg-slate-900 border border-slate-700 text-white rounded-lg px-4 py-3 focus:ring-2 focus:ring-purple-500 focus:border-transparent outline-none transition-all">
+                <option value="">-- Choose a player --</option>
+                {% for player in analyzed_players %}
+                    <option value="{{ player }}">{{ player }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <!-- Chat Box -->
+        <div id="chat-box" class="flex-1 bg-slate-900/50 border border-slate-800 rounded-2xl p-6 overflow-y-auto scrollbar-hide space-y-4 mb-4">
+            <div class="flex justify-center">
+                <div class="bg-slate-800/50 text-slate-400 text-xs px-3 py-1 rounded-full border border-slate-700">
+                    Ask about footwork, posture, shot technique, or specific drills.
+                </div>
+            </div>
+        </div>
+        
+        <!-- Input Area -->
+        <div class="relative">
+            <input type="text" id="userInput" 
+                class="w-full bg-slate-900 border border-slate-700 text-white rounded-xl pl-5 pr-14 py-4 focus:ring-2 focus:ring-purple-500 focus:border-transparent outline-none transition-all shadow-lg" 
+                placeholder="e.g., 'How can I improve my smash recovery?'..." 
+                onkeypress="if(event.key==='Enter') sendMessage()">
+            <button onclick="sendMessage()" class="absolute right-2 top-2 bottom-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg px-4 flex items-center justify-center transition-colors shadow-lg shadow-purple-500/20">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+            </button>
+        </div>
+    </main>
+
+    <script>
+        function appendMessage(text, sender) {
+            const chatBox = document.getElementById('chat-box');
+            const div = document.createElement('div');
+            
+            if (sender === 'user') {
+                div.className = "flex justify-end animate-fade-in";
+                div.innerHTML = `<div class="bg-purple-600 text-white px-5 py-3 rounded-2xl rounded-tr-sm max-w-[80%] shadow-lg shadow-purple-500/10 text-sm leading-relaxed">${text}</div>`;
+            } else {
+                div.className = "flex justify-start animate-fade-in";
+                div.innerHTML = `<div class="bg-slate-800 text-slate-200 px-5 py-3 rounded-2xl rounded-tl-sm max-w-[80%] border border-slate-700 text-sm leading-relaxed whitespace-pre-wrap">${text}</div>`;
+            }
+            
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('userInput');
+            const player = document.getElementById('playerSelect').value;
+            const text = input.value.trim();
+            
+            if (!text) return;
+            if (!player) {
+                alert("Please select a player from the dropdown first.");
+                return;
+            }
+
+            appendMessage(text, 'user');
+            input.value = '';
+            appendMessage("Thinking...", 'ai');
+
+            try {
+                const response = await fetch("/player-chat", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ player: player, question: text })
+                });
+                const data = await response.json();
+                
+                const chatBox = document.getElementById('chat-box');
+                chatBox.lastChild.remove(); // Remove "Thinking..."
+                
+                if (data.success) {
+                    appendMessage(data.reply, 'ai');
+                } else {
+                    appendMessage("Error: " + data.error, 'ai');
+                }
+            } catch (err) {
+                const chatBox = document.getElementById('chat-box');
+                chatBox.lastChild.remove();
+                appendMessage("Failed to connect to AI coach. Please try again.", 'ai');
+            }
+        }
+    </script>
+</body>
+</html>
