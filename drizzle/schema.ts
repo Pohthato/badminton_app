@@ -35,6 +35,8 @@ export const analysisSessions = mysqlTable("analysisSessions", {
   status: mysqlEnum("status", ["draft", "queued", "processing", "completed", "failed"]).default("draft").notNull(),
   calibration: json("calibration").notNull(),
   workerJobId: varchar("workerJobId", { length: 128 }),
+  failureReason: text("failureReason"),
+  lastWorkerStatusAt: timestamp("lastWorkerStatusAt"),
   result: json("result"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),

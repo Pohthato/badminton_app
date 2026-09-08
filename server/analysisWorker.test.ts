@@ -8,6 +8,7 @@ import {
 const request = {
   analysisId: "analysis-1",
   videoStorageKey: "analysis-sources/1/video.mp4",
+  sourceVideoUrl: "https://storage.example.test/source.mp4?signature=short-lived",
   selectedPlayer: "near" as const,
   calibration: {
     corners: [],
@@ -60,9 +61,10 @@ describe("analysis worker handoff", () => {
       "https://api.runpod.ai/v2/endpoint-1/run",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ input: request }),
+        body: expect.stringContaining('"input"'),
       })
     );
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ input: request, policy: { executionTimeout: 900_000, ttl: 3_600_000 } });
   });
 
   it("maps RunPod status responses to the OmniCourt lifecycle", async () => {
@@ -141,7 +143,9 @@ describe("analysis worker handoff", () => {
     const result = {
       processingVersion: "runpod-v1",
       metrics: [],
-      quality: { usableFrameRatio: 1 },
+      calibration: { corners: [{ label: "nearLeft", x: 10, y: 80 }, { label: "nearRight", x: 90, y: 80 }, { label: "farRight", x: 70, y: 20 }, { label: "farLeft", x: 30, y: 20 }], confidence: "validated", supportsCourtMapping: true, guidance: "accepted" },
+      shotDistribution: {},
+      quality: { usableFrameRatio: 1, poseTrackConfidence: 1, shuttleTrackConfidence: 1 },
     } as any;
     vi.stubGlobal(
       "fetch",

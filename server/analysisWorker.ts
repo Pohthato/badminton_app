@@ -1,8 +1,12 @@
+import crypto from "node:crypto";
 import { AnalysisResult, Calibration } from "./analysis";
+import { analysisResultSchema } from "./analysisSchema";
 
 export type WorkerJobRequest = {
   analysisId: string;
   videoStorageKey: string;
+  /** Short-lived, read-only URL. Workers must never receive storage credentials. */
+  sourceVideoUrl: string;
   selectedPlayer: "near" | "far";
   calibration: Calibration;
   requestedLayers: Array<"skeleton" | "shuttle" | "racket" | "courtMap">;
@@ -15,6 +19,19 @@ export type WorkerJobStatusResponse = {
   result?: AnalysisResult;
   error?: string;
 };
+
+export function getWorkerCallbackToken(analysisId: string) {
+  const secret = process.env.WORKER_CALLBACK_SECRET;
+  if (!secret) return undefined;
+  return crypto.createHmac("sha256", secret).update(analysisId).digest("hex");
+}
+
+function runpodWebhookUrl(analysisId: string) {
+  const publicAppUrl = process.env.PUBLIC_APP_URL?.replace(/\/$/, "");
+  const digest = getWorkerCallbackToken(analysisId);
+  if (!publicAppUrl || !digest) return undefined;
+  return `${publicAppUrl}/api/worker-complete/${encodeURIComponent(analysisId)}?token=${digest}`;
+}
 
 function isRunpodEndpoint(workerUrl: string) {
   return workerUrl.includes("api.runpod.ai/v2/");
@@ -78,10 +95,20 @@ export async function submitAnalysisWorkerJob(
 
   if (isRunpodEndpoint(workerUrl)) {
     const endpoint = `${runpodRoot(workerUrl)}/run`;
+    const webhook = runpodWebhookUrl(request.analysisId);
     const response = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify({ input: request }),
+      body: JSON.stringify({
+        input: request,
+        ...(webhook ? { webhook } : {}),
+        policy: {
+          // Video analysis is asynchronous. Bound both active execution and
+          // total lifetime so an unavailable worker cannot create zombie jobs.
+          executionTimeout: Number(process.env.CV_WORKER_EXECUTION_TIMEOUT_MS ?? 900_000),
+          ttl: Number(process.env.CV_WORKER_TTL_MS ?? 3_600_000),
+        },
+      }),
     });
     if (!response.ok) {
       const detail = await responseDetail(response);
@@ -176,14 +203,11 @@ export async function getAnalysisWorkerJob(
 }
 
 export function validateWorkerResult(result: AnalysisResult) {
-  if (!result.processingVersion || !Array.isArray(result.metrics))
-    throw new Error(
-      "Worker result is missing a processing version or metrics."
-    );
-  if (
-    result.quality.usableFrameRatio < 0 ||
-    result.quality.usableFrameRatio > 1
-  )
-    throw new Error("Worker result contains an invalid usable frame ratio.");
-  return result;
+  // Keep the parser at the untrusted network boundary. A worker completion is
+  // evidence only after its structure and confidence constraints validate.
+  const parsed = analysisResultSchema.safeParse(result);
+  if (!parsed.success) {
+    throw new Error(`Worker result validation failed: ${parsed.error.issues[0]?.message ?? "invalid result"}`);
+  }
+  return parsed.data as AnalysisResult;
 }

@@ -8,6 +8,9 @@ import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
+import crypto from "node:crypto";
+import { reconcileAnalysisWorkerJob } from "../analysisCompletion";
+import { getWorkerCallbackToken } from "../analysisWorker";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -34,6 +37,24 @@ async function startServer() {
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.post("/api/worker-complete/:analysisId", async (req, res) => {
+    const expected = getWorkerCallbackToken(req.params.analysisId);
+    const received = typeof req.query.token === "string" ? req.query.token : "";
+    if (!expected || received.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))) {
+      res.status(401).json({ error: "Invalid worker callback token." });
+      return;
+    }
+    try {
+      const result = await reconcileAnalysisWorkerJob(req.params.analysisId);
+      // A valid callback for a deleted/unknown session should not become an
+      // enumeration oracle, but it has still been safely handled.
+      res.status(200).json({ accepted: true, status: result.status });
+    } catch (error) {
+      console.error("[Worker callback] reconciliation failed", error);
+      // RunPod retries a non-200 webhook. Let transient storage/API failures retry.
+      res.status(503).json({ error: "Temporary completion reconciliation failure." });
+    }
+  });
   registerStorageProxy(app);
   registerOAuthRoutes(app);
   // tRPC API

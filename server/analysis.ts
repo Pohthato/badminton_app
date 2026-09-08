@@ -52,6 +52,14 @@ export type AnalysisResult = {
     racket?: { grip: { x: number; y: number; confidence: number }; head: { x: number; y: number; confidence: number } };
     courtPosition?: { x: number; y: number; confidence: number };
   }>;
+  diagnostics?: {
+    sampledFrames: number;
+    sourceFps: number;
+    sampleFps: number;
+    timingsMs: { download: number; decode: number; inference: number; render: number; total: number };
+    modelVersions: Record<string, string>;
+    warnings: string[];
+  };
 };
 
 export type SkeletonFrame = {

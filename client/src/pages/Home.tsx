@@ -59,6 +59,20 @@ type Corner = { x: number; y: number };
 type Layer = "Skeleton" | "Shuttle" | "Racket" | "Court map";
 type StoredAnalysisResult = {
   annotatedVideoStorageKey?: string;
+  metrics?: Array<{
+    metric: string;
+    value: number;
+    unit: string;
+    confidence: number;
+  }>;
+  quality?: {
+    usableFrameRatio?: number;
+    poseTrackConfidence?: number;
+    shuttleTrackConfidence?: number;
+  };
+  diagnostics?: {
+    warnings?: string[];
+  };
   overlays?: VerifiedOverlayFrame[];
   calibration?: {
     confidence?:
@@ -243,6 +257,20 @@ export default function Home() {
     { id: sessionId ?? "pending" },
     { enabled: Boolean(sessionId), refetchInterval: sessionId ? 12_000 : false }
   );
+  const workerStatus = sessionQuery.data?.status;
+
+  useEffect(() => {
+    if (!sessionId || (workerStatus !== "queued" && workerStatus !== "processing")) return;
+    const refresh = () => {
+      refreshMutation.mutate(
+        { id: sessionId },
+        { onSuccess: () => void sessionQuery.refetch() }
+      );
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 12_000);
+    return () => window.clearInterval(timer);
+  }, [sessionId, workerStatus]);
   const queueNotice = getAnalysisQueueNotice(
     sessionQuery.data?.status ?? "draft",
     sessionQuery.data?.createdAt
@@ -392,6 +420,14 @@ export default function Home() {
       );
       return;
     }
+    if (videoFile.size > 1_500_000_000) {
+      toast.error("Use a video below 1.5 GB. Trim a longer match into rallies before analysis.");
+      return;
+    }
+    if (duration > 600) {
+      toast.error("Use footage up to 10 minutes. For longer matches, upload individual rallies or drills.");
+      return;
+    }
 
     setSubmissionState("uploading");
     let submissionStage = "secure upload preparation";
@@ -454,7 +490,7 @@ export default function Home() {
       if (update.status === "completed")
         toast.success("Verified annotated replay is ready.");
       else if (update.status === "failed")
-        toast.error(update.error || "The worker reported an analysis failure.");
+        toast.error(("error" in update ? update.error : undefined) || "The worker reported an analysis failure.");
       else toast.info(`Analysis is ${update.status}.`);
     } catch (error) {
       toast.error(
@@ -1197,6 +1233,52 @@ export default function Home() {
         </section>
 
         {hasCompletedResult && (
+          <>
+            <section className="panel-surface mt-5 rounded-2xl p-5">
+              <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+                <div>
+                  <p className="font-mono-data text-[10px] uppercase tracking-[.16em] text-[#b7fa59]">
+                    Verified evidence report
+                  </p>
+                  <h2 className="mt-1 text-lg font-extrabold tracking-[-.035em] text-white">
+                    Measurements, not a highlight reel.
+                  </h2>
+                </div>
+                <div className="flex gap-2 font-mono-data text-[10px]">
+                  <span className="rounded-md border border-white/10 px-2 py-1 text-slate-400">
+                    Pose {Math.round((completedResult?.quality?.poseTrackConfidence ?? 0) * 100)}%
+                  </span>
+                  <span className="rounded-md border border-white/10 px-2 py-1 text-slate-400">
+                    Shuttle {Math.round((completedResult?.quality?.shuttleTrackConfidence ?? 0) * 100)}%
+                  </span>
+                </div>
+              </div>
+              {(completedResult?.metrics?.length ?? 0) > 0 ? (
+                <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                  {completedResult?.metrics?.map(item => (
+                    <div key={item.metric} className="rounded-xl border border-white/8 bg-white/[.025] p-3">
+                      <p className="text-[11px] font-bold text-slate-200">{item.metric}</p>
+                      <p className="mt-1 font-mono-data text-lg text-[#d9ffad]">
+                        {Number.isInteger(item.value) ? item.value : item.value.toFixed(2)} <span className="text-[10px] text-slate-500">{item.unit}</span>
+                      </p>
+                      <p className="mt-1 text-[10px] text-slate-500">Evidence confidence {Math.round(item.confidence * 100)}%</p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/[.05] p-3 text-xs leading-5 text-amber-100/80">
+                  No metric passed the evidence threshold for this footage. Review the capture guidance and the per-layer states before relying on coaching.
+                </p>
+              )}
+              {(completedResult?.diagnostics?.warnings?.length ?? 0) > 0 && (
+                <div className="mt-4 rounded-xl border border-white/8 bg-black/10 p-3">
+                  <p className="font-mono-data text-[9px] uppercase tracking-[.14em] text-slate-500">Analysis notes</p>
+                  <ul className="mt-2 space-y-1 text-[11px] leading-5 text-slate-400">
+                    {completedResult?.diagnostics?.warnings?.map(note => <li key={note}>• {note}</li>)}
+                  </ul>
+                </div>
+              )}
+            </section>
           <section className="panel-surface mt-5 overflow-hidden rounded-2xl">
             <div className="grid lg:grid-cols-[.8fr_1.2fr]">
               <div className="border-b border-white/8 p-6 lg:border-b-0 lg:border-r">
@@ -1247,6 +1329,7 @@ export default function Home() {
               </div>
             </div>
           </section>
+          </>
         )}
       </main>
     </div>

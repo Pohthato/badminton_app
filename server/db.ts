@@ -105,6 +105,14 @@ export async function getAnalysisSessionForUser(id: string, userId: number) {
   return rows[0];
 }
 
+/** Only server-to-server completion code may use this lookup. */
+export async function getAnalysisSessionById(id: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available for analysis session lookup");
+  const rows = await db.select().from(analysisSessions).where(eq(analysisSessions.id, id)).limit(1);
+  return rows[0];
+}
+
 export async function listAnalysisSessionsForUser(userId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available for analysis session lookup");
@@ -115,10 +123,22 @@ export async function listAnalysisSessionsForUser(userId: number) {
 export async function updateAnalysisSessionForUser(
   id: string,
   userId: number,
-  update: Pick<InsertAnalysisSession, "status" | "workerJobId" | "result">
+  update: Pick<InsertAnalysisSession, "status" | "workerJobId" | "result" | "failureReason" | "lastWorkerStatusAt">
 ) {
   const db = await getDb();
   if (!db) throw new Error("Database is not available for analysis session updates");
 
   await db.update(analysisSessions).set(update).where(and(eq(analysisSessions.id, id), eq(analysisSessions.userId, userId)));
+}
+
+export async function updateAnalysisSessionFromWorker(
+  id: string,
+  workerJobId: string,
+  update: Pick<InsertAnalysisSession, "status" | "result" | "failureReason" | "lastWorkerStatusAt">
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not available for analysis session updates");
+  // Match the job id as well as the session. This makes stale RunPod
+  // callbacks unable to overwrite a retried analysis.
+  await db.update(analysisSessions).set(update).where(and(eq(analysisSessions.id, id), eq(analysisSessions.workerJobId, workerJobId)));
 }
