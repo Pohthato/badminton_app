@@ -24,6 +24,7 @@ vi.mock("@/lib/trpc", () => {
       analysis: {
         createDraft: { useMutation: () => ({ mutateAsync: createDraftMock, isPending: false }) },
         submit: { useMutation: () => ({ mutateAsync: submitMock, isPending: false }) },
+        warmupGpu: { useMutation: () => ({ mutateAsync: vi.fn().mockResolvedValue({ accepted: true }), isPending: false }) },
         refresh: { useMutation: () => ({ mutateAsync: vi.fn(), isPending: false }) },
         get: { useQuery: query },
       },

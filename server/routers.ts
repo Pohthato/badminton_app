@@ -2,9 +2,9 @@ import { COOKIE_NAME } from "@shared/const";
 import { TRPCError } from "@trpc/server";
 import { nanoid } from "nanoid";
 import { z } from "zod";
-import { AnalysisResult, CourtCorner, buildCoachingPrompt, validateCalibration } from "./analysis";
+import { AnalysisResult, CourtCorner, CourtType, buildCoachingPrompt, validateCalibration } from "./analysis";
 import { analysisResultSchema, cornerSchema } from "./analysisSchema";
-import { submitAnalysisWorkerJob } from "./analysisWorker";
+import { submitAnalysisWorkerJob, submitWorkerWarmup } from "./analysisWorker";
 import { reconcileAnalysisWorkerJob } from "./analysisCompletion";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
@@ -55,11 +55,12 @@ export const appRouter = router({
     createDraft: protectedProcedure.input(z.object({
       sourceName: z.string().trim().min(1).max(255),
       sourceStorageKey: z.string().trim().min(1).max(768),
-      sourceDurationMs: z.number().int().positive().max(600_000).optional(),
+      sourceDurationMs: z.number().int().positive().max(180_000).optional(),
       selectedPlayer: z.enum(["near", "far"]),
+      courtType: z.enum(["singles", "doubles"]).default("singles"),
       corners: z.array(cornerSchema).min(3).max(4),
     })).mutation(async ({ ctx, input }) => {
-      const calibration = validateCalibration(input.corners as CourtCorner[]);
+      const calibration = validateCalibration(input.corners as CourtCorner[], input.courtType as CourtType);
       const id = nanoid(18);
       await createAnalysisSession({ id, userId: ctx.user.id, sourceName: input.sourceName, sourceStorageKey: input.sourceStorageKey, sourceDurationMs: input.sourceDurationMs, selectedPlayer: input.selectedPlayer, calibration });
       return { id, calibration };
@@ -72,9 +73,13 @@ export const appRouter = router({
       if (!session) throw new TRPCError({ code: "NOT_FOUND", message: "Analysis session not found." });
       const calibration = session.calibration as ReturnType<typeof validateCalibration>;
       const sourceVideoUrl = await storageGetSignedUrl(session.sourceStorageKey);
-      const worker = await submitAnalysisWorkerJob({ analysisId: session.id, videoStorageKey: session.sourceStorageKey, sourceVideoUrl, selectedPlayer: session.selectedPlayer, calibration, requestedLayers: input.requestedLayers });
+      const courtType = (session.calibration as { courtType?: "singles" | "doubles" }).courtType ?? "singles";
+      const worker = await submitAnalysisWorkerJob({ analysisId: session.id, videoStorageKey: session.sourceStorageKey, sourceVideoUrl, selectedPlayer: session.selectedPlayer, courtType, calibration, requestedLayers: input.requestedLayers });
       await updateAnalysisSessionForUser(session.id, ctx.user.id, { status: "queued", workerJobId: worker.jobId });
       return worker;
+    }),
+    warmupGpu: protectedProcedure.mutation(async () => {
+      return submitWorkerWarmup();
     }),
     refresh: protectedProcedure.input(z.object({ id: z.string().min(6).max(28) })).mutation(async ({ ctx, input }) => {
       const session = await getAnalysisSessionForUser(input.id, ctx.user.id);

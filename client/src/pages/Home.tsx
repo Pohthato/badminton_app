@@ -230,6 +230,7 @@ export default function Home() {
   const uploadMutation = trpc.upload.prepareVideo.useMutation();
   const draftMutation = trpc.analysis.createDraft.useMutation();
   const submitMutation = trpc.analysis.submit.useMutation();
+  const warmupGpuMutation = trpc.analysis.warmupGpu.useMutation();
   const refreshMutation = trpc.analysis.refresh.useMutation();
   const coachMutation = trpc.coach.chat.useMutation();
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
@@ -347,6 +348,20 @@ export default function Home() {
     setAnalysisRequested(false);
     setSubmissionState("idle");
     setSessionId(null);
+    if (isAuthenticated) {
+      // Predictive GPU warmup: the user is about to calibrate and submit, so
+      // start the serverless worker booting now. Errors are non-fatal.
+      void warmupGpuMutation
+        .mutateAsync()
+        .then(result => {
+          if (result.accepted) {
+            toast.info("GPU worker is warming up for your analysis.");
+          }
+        })
+        .catch(() => {
+          /* cold-start prefetch is best-effort */
+        });
+    }
   };
 
   const recordCorner = (event: React.MouseEvent<HTMLDivElement>) => {

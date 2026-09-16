@@ -13,6 +13,26 @@ const evidenceSchema = z.object({
   source: z.enum(["pose", "shuttle", "racket", "court"]),
 });
 
+const eventSchema = z.object({
+  type: z.enum(["contact", "split_step", "recovery_complete", "racket_swing", "rally_start", "rally_end"]),
+  frame: z.number().int().nonnegative(),
+  timeMs: z.number().nonnegative(),
+  confidence: z.number().min(0).max(1),
+  source: z.enum(["pose", "shuttle", "racket", "court"]),
+});
+
+const shotSchema = z.object({
+  frame: z.number().int().nonnegative(),
+  timeMs: z.number().nonnegative(),
+  confidence: z.number().min(0).max(1),
+  label: z.string().min(1).max(32),
+  verified: z.boolean(),
+  direction: z.enum(["cross", "straight", "unknown"]),
+  depth: z.enum(["short", "mid", "back", "unknown"]),
+  landingSide: z.enum(["opponent_half", "own_half", "unclear"]).optional(),
+  rallyIndex: z.number().int().nonnegative(),
+});
+
 export const analysisResultSchema = z.object({
   processingVersion: z.string().min(1).max(96),
   calibration: z.object({
@@ -20,7 +40,9 @@ export const analysisResultSchema = z.object({
     confidence: z.enum(["unverified", "provisional", "validated", "image_space_only"]),
     supportsCourtMapping: z.boolean(),
     guidance: z.string().min(1).max(1_000).default("Worker calibration guidance was not provided; treat geometry as unverified."),
+    courtType: z.enum(["singles", "doubles"]).optional(),
   }),
+  courtType: z.enum(["singles", "doubles"]).optional(),
   quality: z.object({
     usableFrameRatio: z.number().min(0).max(1),
     poseTrackConfidence: z.number().min(0).max(1),
@@ -39,6 +61,15 @@ export const analysisResultSchema = z.object({
     distribution => Object.values(distribution).every(Number.isInteger),
     "Shot distribution counts must be whole numbers."
   ),
+  events: z.array(eventSchema).max(240).optional(),
+  rallies: z.array(z.object({
+    index: z.number().int().nonnegative(),
+    startMs: z.number().nonnegative(),
+    endMs: z.number().nonnegative(),
+    contactCount: z.number().int().nonnegative(),
+    verifiedShots: z.number().int().nonnegative(),
+  })).max(48).optional(),
+  shots: z.array(shotSchema).max(240).optional(),
   annotatedVideoStorageKey: z.string().min(1).max(768).optional(),
   overlays: z.array(z.object({
     timeMs: z.number().nonnegative(),
@@ -52,11 +83,14 @@ export const analysisResultSchema = z.object({
     sampledFrames: z.number().int().nonnegative().max(1_000_000),
     sourceFps: z.number().positive().max(960),
     sampleFps: z.number().positive().max(120),
+    poseSampleFps: z.number().positive().max(120).optional(),
+    shuttleSampleFps: z.number().positive().max(120).optional(),
+    racketSampleFps: z.number().positive().max(120).optional(),
     timingsMs: z.object({
       download: z.number().nonnegative(), decode: z.number().nonnegative(), inference: z.number().nonnegative(), render: z.number().nonnegative(), total: z.number().nonnegative(),
     }),
     modelVersions: z.record(z.string().min(1).max(64), z.string().min(1).max(128)),
-    warnings: z.array(z.string().min(1).max(300)).max(32),
+    warnings: z.array(z.string().min(1).max(400)).max(32),
   }).optional(),
 }).superRefine((result, ctx) => {
   if (result.calibration.supportsCourtMapping && result.calibration.confidence !== "validated") {

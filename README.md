@@ -1,51 +1,61 @@
-# OmniCourt - Badminton AI Analyzer v3
+# OmniCourt Pro — Badminton AI Analyzer
 
 ## Features
-- **Player Detection**: YOLOv8 custom badminton action model
-- **Skeleton Tracking**: YOLOv8-Pose (40-60 FPS on GPU)
-- **Court Mapping**: Auto + manual homography for real-world metrics
-- **AI Coaching**: DeepSeek API for personalized feedback
-- **Background Processing**: Celery + Redis for long videos
+- **Player Detection & Pose**: YOLOv8-Pose badminton action model with confident
+  skeleton-only overlays (no persistent person boxes).
+- **Court Mapping**: Auto + manual homography with honesty states
+  (provisional → validated → image-space-only), BWF singles/doubles dimensions,
+  and court coverage in metres.
+- **Shuttle & Racket Tracking**: Tiny-object detectors plus Kalman tracking.
+  Contact events require a direction reversal or speed collapse plus racket/wrist
+  proximity. Shot labels (smash/clear/drop/net/lift/drive/push/serve) are
+  confidence-gated heuristics, never ground truth.
+- **Badminton Event Layer**: contacts, rallies, split steps, recoveries, racket
+  swings, split-step amplitude, racket swing speed, shot landing side.
+- **AI Coaching**: DeepSeek API fed only high-confidence, timestamped evidence,
+  with explicit instructions about calibration limits and uncertainty.
+- **Serverless GPU Worker**: RunPod queue-based endpoint, worker concurrency
+  (one GPU runs two analyses), keep-warm scheduler so the first user skips the
+  cold start, and an authenticated signed-webhook completion flow.
 
-## Quick Start (Local)
+## Architecture
+
+- `server/` — Express + tRPC API, analysis sessions, storage, worker client.
+- `worker/` — Python/RunPod serverless CV worker (YOLO pose/shuttle/racket,
+  event layer, metric calculators).
+- `client/` — React workspace with calibration canvas and overlay review.
+- `docs/` — worker contract, evaluation protocol, RunPod deployment guide,
+  analysis architecture.
+
+## Quick Start (local app)
 ```bash
-pip install -r requirements_v2.txt
-# Start Redis
-docker run -d -p 6379:6379 redis:7-alpine
-# Start Celery worker
-celery -A tasks worker --loglevel=info --pool=solo
-# Start Flask
-python app_v2.py
+pnpm install
+pnpm dev
 ```
+Set `DEEPSEEK_API_KEY`, `DATABASE_URL`, storage, and `CV_WORKER_*` in `.env`
+(see `.env.example`) to enable analysis submission.
 
-## Quick Start (Docker)
-```bash
-docker-compose up -d
-```
-
-## Kaggle Deployment
-1. Upload all files to a Kaggle Dataset
-2. Create notebook with the provided cells
-3. Run all cells → get Cloudflared URL
+## Worker (RunPod)
+See `docs/runpod-production.md`. Must be built with licensed weight files in
+`worker/weights/`:
+`badminton_pose.pt`, `shuttlecock_yolov8n.pt`, and, when available,
+`badminton_racket.pt`.
 
 ## Environment Variables
 Copy `.env.example` to `.env` and set:
-- `DEEPSEEK_API_KEY` - Your DeepSeek API key
-- `REDIS_URL` - Redis connection string
+- `DEEPSEEK_API_KEY` — DeepSeek API key (coaching chat)
+- `DATABASE_URL` — app database
+- `CV_WORKER_URL` / `CV_WORKER_TOKEN` — RunPod endpoint root + API key
+- `CV_WORKER_KEEP_WARM_ENABLED` — keep one GPU warm (product hours)
+- `BUILT_IN_FORGE_API_URL` / `BUILT_IN_FORGE_API_KEY` — storage presign proxy
 
 ## Video Limits
-- Max duration: 2 minutes (configurable in tasks.py)
-- Max file size: 512MB
-- Max frames: 3000 (~2 min at 25fps)
+- Max duration: 120 seconds (worker limit, configurable)
+- Max file size: 1.5 GB
+- Guidance: keep the whole court visible, stable rear/side view, 60+ fps
 
-## Court Calibration
-- Auto-detects court lines on first frame
-- Manual override: click "Mark Court Corners" on upload page
-- Enter 4 corner coordinates (TL, TR, BR, BL)
-
-## Fixed Bugs (v3)
-- Python 3.12 f-string syntax errors
-- NumPy 2.x dtype casting crashes
-- Slow keypointrcnn replaced with YOLOv8-Pose (10x faster)
-- Safe Celery task status handling
-- Array shape validation in pose processing
+## Evaluation
+Capabilities must not launch merely because an interface can draw them — see
+`docs/evaluation-protocol.md`. Metrics: keypoint OKS, shuttle recall/precision,
+contact timing error vs labelled hits, stroke-label macro F1, court reprojection
+error, blinded coach agreement.

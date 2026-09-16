@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCoachingPrompt, computeBiomechanicsMetrics, deriveProvisionalFourthCorner, validateCalibration } from "./analysis";
+import { buildCoachingPrompt, buildRallySequenceModel, collectFailureCases, computeBiomechanicsMetrics, deriveProvisionalFourthCorner, evaluateAnalysisQuality, evaluateByVideoCondition, summarizeRallyPatterns, validateCalibration } from "./analysis";
 import { validateWorkerResult } from "./analysisWorker";
 
 const completeCorners = [
@@ -46,7 +46,7 @@ describe("frame-level biomechanics metrics", () => {
         { frame: 2, timeMs: 66, confidence: 0.8, xMeters: 2, yMeters: 2 },
       ],
     });
-    expect(metrics.map((metric) => metric.metric)).toEqual(expect.arrayContaining(["base width", "trunk angle", "knee loading", "court coverage"]));
+    expect(metrics.map((metric) => metric.metric)).toEqual(expect.arrayContaining(["base width", "trunk angle", "knee flexion angle (2D)", "court coverage"]));
     expect(metrics.find((metric) => metric.metric === "court coverage")?.value).toBeCloseTo(Math.sqrt(2));
   });
 
@@ -128,5 +128,135 @@ describe("coaching prompt construction", () => {
     expect(prompt).not.toContain("racket path");
     expect(prompt).toContain("frame\":72");
     expect(prompt).toContain("Do not diagnose injuries");
+  });
+
+  it("summarizes session evidence quality and tactical pattern before giving coaching guidance", () => {
+    const calibration = validateCalibration(completeCorners);
+    const prompt = buildCoachingPrompt({
+      player: "near",
+      calibration,
+      result: {
+        processingVersion: "cv-1.0.0",
+        calibration,
+        quality: { usableFrameRatio: 0.83, poseTrackConfidence: 0.9, shuttleTrackConfidence: 0.77, courtReprojectionErrorPx: 14 },
+        metrics: [
+          { metric: "court coverage", value: 9.4, unit: "metres travelled", direction: "contextual", confidence: 0.92, evidenceFrames: [{ frame: 10, timeMs: 330, confidence: 0.92, source: "court" }] },
+          { metric: "split-step timing", value: 220, unit: "ms", direction: "contextual", confidence: 0.89, evidenceFrames: [{ frame: 17, timeMs: 560, confidence: 0.89, source: "pose" }] },
+        ],
+        shots: [
+          { frame: 1, timeMs: 200, confidence: 0.8, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+          { frame: 2, timeMs: 600, confidence: 0.82, label: "smash", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+          { frame: 3, timeMs: 850, confidence: 0.79, label: "drop", verified: true, direction: "straight", depth: "short", rallyIndex: 0 },
+        ],
+        shotDistribution: { clear: 1, smash: 1, drop: 1 },
+        rallies: [{ index: 0, startMs: 0, endMs: 1100, contactCount: 3, verifiedShots: 3 }],
+      },
+      question: "What is the main tactical pattern?",
+    });
+
+    expect(prompt).toContain("Evidence quality");
+    expect(prompt).toContain("Tactical pattern");
+    expect(prompt).toContain("clear");
+    expect(prompt).toContain("smash");
+    expect(prompt).toContain("main tactical pattern");
+  });
+
+  it("derives rally-level summaries that reflect actual shot sequences and attack balance", () => {
+    const calibration = validateCalibration(completeCorners);
+    const summary = summarizeRallyPatterns({
+      processingVersion: "cv-1.0.0",
+      calibration,
+      quality: { usableFrameRatio: 0.8, poseTrackConfidence: 0.8, shuttleTrackConfidence: 0.8 },
+      metrics: [],
+      shotDistribution: { clear: 2, smash: 1 },
+      rallies: [
+        { index: 0, startMs: 0, endMs: 900, contactCount: 2, verifiedShots: 2 },
+        { index: 1, startMs: 1000, endMs: 1800, contactCount: 3, verifiedShots: 3 },
+      ],
+      shots: [
+        { frame: 1, timeMs: 100, confidence: 0.8, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+        { frame: 2, timeMs: 200, confidence: 0.8, label: "smash", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+        { frame: 3, timeMs: 1200, confidence: 0.8, label: "clear", verified: true, direction: "straight", depth: "mid", rallyIndex: 1 },
+        { frame: 4, timeMs: 1300, confidence: 0.8, label: "drop", verified: true, direction: "straight", depth: "short", rallyIndex: 1 },
+        { frame: 5, timeMs: 1500, confidence: 0.8, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 1 },
+      ],
+    });
+
+    expect(summary.rallyCount).toBe(2);
+    expect(summary.dominantStroke).toBe("clear");
+    expect(summary.attackRatio).toBeGreaterThan(0.5);
+    expect(summary.averageRallyLengthMs).toBe(850);
+  });
+
+  it("produces a benchmark-ready evaluation summary with measurable strengths and risks", () => {
+    const calibration = validateCalibration(completeCorners);
+    const evaluation = evaluateAnalysisQuality({
+      processingVersion: "cv-1.0.0",
+      calibration,
+      quality: { usableFrameRatio: 0.86, poseTrackConfidence: 0.9, shuttleTrackConfidence: 0.8, courtReprojectionErrorPx: 18 },
+      metrics: [
+        { metric: "court coverage", value: 9.4, unit: "metres travelled", direction: "contextual", confidence: 0.92, evidenceFrames: [{ frame: 10, timeMs: 330, confidence: 0.92, source: "court" }] },
+        { metric: "split-step timing", value: 220, unit: "ms", direction: "contextual", confidence: 0.89, evidenceFrames: [{ frame: 17, timeMs: 560, confidence: 0.89, source: "pose" }] },
+      ],
+      shots: [
+        { frame: 1, timeMs: 150, confidence: 0.8, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+        { frame: 2, timeMs: 620, confidence: 0.82, label: "smash", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+      ],
+      shotDistribution: { clear: 1, smash: 1 },
+      rallies: [{ index: 0, startMs: 0, endMs: 900, contactCount: 2, verifiedShots: 2 }],
+    });
+
+    expect(evaluation.overallScore).toBeGreaterThan(70);
+    expect(evaluation.strengths.some((strength) => strength.toLowerCase().includes("pose"))).toBe(true);
+    expect(evaluation.riskFlags.some((flag) => flag.toLowerCase().includes("reprojection"))).toBe(true);
+    expect(evaluation.evidenceStatus).toMatch(/strong|moderate|weak/i);
+  });
+
+  it("evaluates the session by camera angle, lighting, and skill level with scenario-specific scoring", () => {
+    const calibration = validateCalibration(completeCorners);
+    const evaluation = evaluateByVideoCondition({
+      processingVersion: "cv-1.0.0",
+      calibration,
+      quality: { usableFrameRatio: 0.82, poseTrackConfidence: 0.88, shuttleTrackConfidence: 0.74 },
+      metrics: [
+        { metric: "court coverage", value: 7.6, unit: "metres travelled", direction: "contextual", confidence: 0.81, evidenceFrames: [{ frame: 10, timeMs: 330, confidence: 0.81, source: "court" }] },
+      ],
+      shotDistribution: { clear: 2 },
+      shots: [{ frame: 1, timeMs: 150, confidence: 0.72, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 0 }],
+      rallies: [{ index: 0, startMs: 0, endMs: 900, contactCount: 1, verifiedShots: 1 }],
+    }, {
+      cameraAngle: "rear",
+      lighting: "mixed",
+      skillLevel: "intermediate",
+    });
+
+    expect(evaluation.cameraAngle.score).toBeGreaterThan(0);
+    expect(evaluation.lighting.score).toBeGreaterThan(0);
+    expect(evaluation.skillLevel.score).toBeGreaterThan(0);
+    expect(evaluation.overallScore).toBeGreaterThan(0);
+    expect(evaluation.factorSummary).toContain("camera angle");
+  });
+
+  it("builds a rally sequence model and extracts failure cases from weak evidence", () => {
+    const calibration = validateCalibration(completeCorners.slice(0, 3));
+    const result = {
+      processingVersion: "cv-1.0.0",
+      calibration,
+      quality: { usableFrameRatio: 0.45, poseTrackConfidence: 0.55, shuttleTrackConfidence: 0.52 },
+      metrics: [],
+      shotDistribution: { clear: 1 },
+      shots: [
+        { frame: 1, timeMs: 100, confidence: 0.7, label: "clear", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+        { frame: 2, timeMs: 300, confidence: 0.68, label: "drop", verified: true, direction: "straight", depth: "short", rallyIndex: 0 },
+        { frame: 3, timeMs: 650, confidence: 0.74, label: "smash", verified: true, direction: "cross", depth: "back", rallyIndex: 0 },
+      ],
+      rallies: [{ index: 0, startMs: 0, endMs: 700, contactCount: 3, verifiedShots: 3 }],
+    };
+
+    const sequence = buildRallySequenceModel(result);
+    expect(sequence.sequence.length).toBe(3);
+    expect(sequence.patterns.length).toBeGreaterThan(0);
+    const failures = collectFailureCases(result);
+    expect(failures.some((failure) => failure.type.includes("court") || failure.type.includes("pose") || failure.type.includes("shuttle"))).toBe(true);
   });
 });

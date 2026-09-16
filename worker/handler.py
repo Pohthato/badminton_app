@@ -1,9 +1,8 @@
 """OmniCourt RunPod worker.
 
-This worker deliberately treats a model result as absent rather than inventing
-badminton events. Pose and shuttle outputs are confidence-gated. Shot labels,
-racket paths, contact timing, and 3D claims require their dedicated model or
-validated evidence and remain explicitly unavailable otherwise.
+Pose and shuttle outputs are confidence-gated. Shot labels require observed
+contact plus a post-contact shuttle track. Warmup jobs load models without
+running a video so a customer calibration can hide GPU boot time.
 """
 from __future__ import annotations
 
@@ -22,19 +21,26 @@ import requests
 import runpod
 from ultralytics import YOLO
 
+from badminton import (
+    COURT_LENGTH_M,
+    build_event_layer,
+    capture_warnings,
+    court_width_m,
+)
+
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/opt/omnicourt/models"))
 POSE_MODEL_PATH = MODEL_DIR / os.environ.get("POSE_MODEL_FILE", "badminton_pose.pt")
 SHUTTLE_MODEL_PATH = MODEL_DIR / os.environ.get("SHUTTLE_MODEL_FILE", "shuttlecock_yolov8n.pt")
 RACKET_MODEL_PATH = MODEL_DIR / os.environ.get("RACKET_MODEL_FILE", "badminton_racket.pt")
-MAX_VIDEO_SECONDS = float(os.environ.get("MAX_VIDEO_SECONDS", "600"))
-DEFAULT_SAMPLE_FPS = float(os.environ.get("ANALYSIS_SAMPLE_FPS", "12"))
+MAX_VIDEO_SECONDS = float(os.environ.get("MAX_VIDEO_SECONDS", "120"))
+POSE_SAMPLE_FPS = float(os.environ.get("POSE_SAMPLE_FPS", "12"))
+SHUTTLE_SAMPLE_FPS = float(os.environ.get("SHUTTLE_SAMPLE_FPS", "30"))
 MIN_CONFIDENCE = float(os.environ.get("MIN_DETECTION_CONFIDENCE", "0.55"))
-
-COCO_SKELETON = (
-    (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12),
-    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-)
-STROKE_LABELS = ("smash", "clear", "drop", "net", "lift", "drive", "push", "serve")
+PROCESSING_VERSION = os.environ.get("PROCESSING_VERSION", "omnicourt-badminton-worker-2.0.0")
+# RunPod workers handle one job per process by default. Setting concurrency lets
+# ONE warm GPU accept several small video analyses in parallel — the three YOLO
+# nano/medium-class models share a 12-24 GB card comfortably at 2-3 processes.
+HANDLER_CONCURRENCY = int(os.environ.get("HANDLER_CONCURRENCY", "2"))
 
 
 @dataclass
@@ -43,14 +49,12 @@ class Models:
     shuttle: YOLO | None = None
     racket: YOLO | None = None
     warnings: list[str] = field(default_factory=list)
+    ready: bool = False
 
 
-def load_model(path: Path, name: str, required: bool) -> YOLO | None:
+def load_model(path: Path, name: str) -> YOLO | None:
     if not path.is_file():
-        message = f"{name} model is not installed at {path.name}; this layer was not inferred."
-        if required:
-            raise RuntimeError(message)
-        MODELS.warnings.append(message)
+        MODELS.warnings.append(f"{name} model is not installed at {path.name}; this layer was not inferred.")
         return None
     return YOLO(str(path))
 
@@ -60,11 +64,12 @@ MODELS = Models()
 
 def initialise_models() -> None:
     """Load once at container boot; never trigger a model download on a job."""
-    if MODELS.pose is not None or MODELS.warnings:
+    if MODELS.ready:
         return
-    MODELS.pose = load_model(POSE_MODEL_PATH, "Badminton pose", required=False)
-    MODELS.shuttle = load_model(SHUTTLE_MODEL_PATH, "Shuttlecock", required=False)
-    MODELS.racket = load_model(RACKET_MODEL_PATH, "Racket", required=False)
+    MODELS.pose = load_model(POSE_MODEL_PATH, "Badminton pose")
+    MODELS.shuttle = load_model(SHUTTLE_MODEL_PATH, "Shuttlecock")
+    MODELS.racket = load_model(RACKET_MODEL_PATH, "Racket")
+    MODELS.ready = True
 
 
 def elapsed(start: float) -> float:
@@ -83,6 +88,8 @@ def validate_job(data: dict[str, Any]) -> None:
         raise ValueError("sourceVideoUrl must be a short-lived HTTPS download URL")
     if data.get("selectedPlayer") not in ("near", "far"):
         raise ValueError("selectedPlayer must be near or far")
+    if data.get("courtType", "singles") not in ("singles", "doubles"):
+        raise ValueError("courtType must be singles or doubles")
     layers = data.get("requestedLayers")
     if not isinstance(layers, list) or not layers or any(layer not in {"skeleton", "shuttle", "racket", "courtMap"} for layer in layers):
         raise ValueError("requestedLayers must contain supported analysis layers")
@@ -127,11 +134,12 @@ def confidence_mean(values: np.ndarray) -> float:
 
 
 class PlayerSelector:
-    """Stable player selection using initial court depth then motion continuity."""
+    """Identity from court depth, then motion and stature continuity."""
 
     def __init__(self, side: str, frame_diagonal: float):
         self.side = side
         self.previous: np.ndarray | None = None
+        self.height = 0.0
         self.frame_diagonal = frame_diagonal
 
     @staticmethod
@@ -146,14 +154,20 @@ class PlayerSelector:
         if not candidates:
             return None
         anchors = [self.anchor(keypoints, scores, box) for keypoints, scores, box, _ in candidates]
+        heights = [float(box[3] - box[1]) for _, _, box, _ in candidates]
         if self.previous is None:
             index = int(np.argmax([anchor[1] for anchor in anchors]) if self.side == "near" else np.argmin([anchor[1] for anchor in anchors]))
         else:
-            distances = [float(np.linalg.norm(anchor - self.previous)) for anchor in anchors]
-            index = int(np.argmin(distances))
-            if distances[index] > self.frame_diagonal * 0.38:
+            costs = []
+            for anchor, height in zip(anchors, heights):
+                motion = float(np.linalg.norm(anchor - self.previous)) / self.frame_diagonal
+                stature = abs(height - self.height) / max(self.height, 1.0) if self.height else 0.0
+                costs.append(motion + 0.35 * stature)
+            index = int(np.argmin(costs))
+            if costs[index] > 0.42:
                 return None
         self.previous = anchors[index]
+        self.height = heights[index]
         return candidates[index]
 
 
@@ -161,19 +175,26 @@ class ShuttleTracker:
     def __init__(self) -> None:
         self.previous: np.ndarray | None = None
         self.velocity = np.zeros(2, dtype=np.float32)
+        self.misses = 0
 
     def pick(self, candidates: list[tuple[np.ndarray, float]], diagonal: float) -> tuple[np.ndarray, float] | None:
         if not candidates:
+            self.misses += 1
+            if self.misses >= 8:
+                self.previous = None
+                self.velocity = np.zeros(2, dtype=np.float32)
             return None
         if self.previous is None:
             point, confidence = max(candidates, key=lambda item: item[1])
         else:
             expected = self.previous + self.velocity
             point, confidence = min(candidates, key=lambda item: np.linalg.norm(item[0] - expected) - item[1] * diagonal * 0.15)
-            if np.linalg.norm(point - expected) > diagonal * 0.25:
+            if np.linalg.norm(point - expected) > diagonal * 0.22:
+                self.misses += 1
                 return None
+        self.misses = 0
         if self.previous is not None:
-            self.velocity = 0.7 * self.velocity + 0.3 * (point - self.previous)
+            self.velocity = 0.65 * self.velocity + 0.35 * (point - self.previous)
         self.previous = point
         return point, confidence
 
@@ -203,17 +224,16 @@ def object_candidates(model: YOLO | None, frame: np.ndarray) -> list[tuple[np.nd
     return output
 
 
-def calibration_homography(calibration: dict[str, Any], frame: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any], float | None]:
+def calibration_homography(calibration: dict[str, Any], frame: np.ndarray, court_type: str) -> tuple[np.ndarray | None, dict[str, Any], float | None]:
     corners = calibration["corners"]
     by_label = {corner.get("label"): corner for corner in corners}
     required = ("nearLeft", "nearRight", "farRight", "farLeft")
+    width_m = court_width_m(court_type)
     if not all(label in by_label for label in required):
         return None, {**calibration, "confidence": "image_space_only", "supportsCourtMapping": False, "guidance": "Fewer than four named court intersections were supplied; movement remains image-space only."}, None
     height, width = frame.shape[:2]
     points = np.float32([[by_label[label]["x"] * width / 100, by_label[label]["y"] * height / 100] for label in required])
-    # Full-court singles dimensions in metres. The order aligns the camera-side
-    # baseline to y=0 and the far baseline to y=13.4.
-    court = np.float32([[0, 0], [6.10, 0], [6.10, 13.40], [0, 13.40]])
+    court = np.float32([[0, 0], [width_m, 0], [width_m, COURT_LENGTH_M], [0, COURT_LENGTH_M]])
     homography = cv2.getPerspectiveTransform(points, court)
     edge = cv2.Canny(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 80, 160)
     support = []
@@ -229,14 +249,14 @@ def calibration_homography(calibration: dict[str, Any], frame: np.ndarray) -> tu
     line_support = float(np.mean(support))
     if line_support < 0.42:
         return None, {**calibration, "confidence": "image_space_only", "supportsCourtMapping": False, "guidance": "Manual corners did not have enough court-line evidence in the source frame. Court movement is withheld; image-space pose remains available."}, line_support
-    return homography, {**calibration, "confidence": "validated", "supportsCourtMapping": True, "guidance": "Four labelled intersections passed the worker's court-line support check. Court-plane movement is available; this does not establish shuttle height or 3D body depth."}, line_support
+    return homography, {**calibration, "confidence": "validated", "supportsCourtMapping": True, "guidance": f"Four labelled intersections passed court-line support on a BWF {court_type} court ({width_m:.2f} x {COURT_LENGTH_M:.2f} m). Court-plane movement is available; this does not establish shuttle height or 3D body depth."}, line_support
 
 
-def project_to_court(point: np.ndarray, homography: np.ndarray | None) -> np.ndarray | None:
+def project_to_court(point: np.ndarray, homography: np.ndarray | None, width_m: float) -> np.ndarray | None:
     if homography is None:
         return None
     projected = cv2.perspectiveTransform(np.array([[point]], dtype=np.float32), homography)[0][0]
-    if not np.isfinite(projected).all() or not (-1 <= projected[0] <= 7.1 and -1 <= projected[1] <= 14.4):
+    if not np.isfinite(projected).all() or not (-1 <= projected[0] <= width_m + 1 and -1 <= projected[1] <= COURT_LENGTH_M + 1):
         return None
     return projected
 
@@ -247,7 +267,7 @@ def metric(metric: str, values: list[float], unit: str, confidence: float, evide
     return {"metric": metric, "value": round(float(np.mean(values)), 3), "unit": unit, "direction": direction, "confidence": round(confidence, 3), "evidenceFrames": evidence[:12]}
 
 
-def calculate_metrics(samples: list[dict[str, Any]], has_court: bool) -> list[dict[str, Any]]:
+def calculate_metrics(samples: list[dict[str, Any]], has_court: bool, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     stance, knees, coverage_steps = [], [], []
     evidence: list[dict[str, Any]] = []
     last_court: np.ndarray | None = None
@@ -270,7 +290,6 @@ def calculate_metrics(samples: list[dict[str, Any]], has_court: bool) -> list[di
         if has_court and current is not None:
             if last_court is not None:
                 step = float(np.linalg.norm(current - last_court))
-                # Suppress pose jitter and impossible frame-to-frame jumps.
                 if 0.025 <= step <= 0.65:
                     coverage_steps.append(step)
             last_court = current
@@ -281,15 +300,56 @@ def calculate_metrics(samples: list[dict[str, Any]], has_court: bool) -> list[di
     ]
     if has_court:
         result.append(metric("court coverage", [sum(coverage_steps)], "metres travelled", confidence, evidence))
+    contacts = [item for item in events if item["type"] == "contact" and item["confidence"] >= 0.65]
+    split_steps = [item for item in events if item["type"] == "split_step" and item["confidence"] >= 0.65]
+    recoveries = [item for item in events if item["type"] == "recovery_complete" and item["confidence"] >= 0.65]
+    if split_steps and contacts:
+        offsets = []
+        for step in split_steps:
+            following = next((contact for contact in contacts if contact["timeMs"] > step["timeMs"]), None)
+            if following:
+                offsets.append(following["timeMs"] - step["timeMs"])
+        if offsets:
+            result.append(metric("split-step to contact", offsets, "ms", float(np.mean([item["confidence"] for item in split_steps])), split_steps, "contextual"))
+    if contacts and recoveries:
+        durations = []
+        evidence_frames = []
+        for contact in contacts:
+            recovery = next((item for item in recoveries if item["timeMs"] > contact["timeMs"]), None)
+            if recovery:
+                durations.append(recovery["timeMs"] - contact["timeMs"])
+                evidence_frames.extend([contact, recovery])
+        if durations:
+            result.append(metric("recovery time", durations, "ms", min(len(durations) / max(len(contacts), 1), 1.0), evidence_frames, "lower_is_better"))
+    if contacts:
+        result.append(metric("verified contacts", [float(len(contacts))], "count", float(np.mean([item["confidence"] for item in contacts])), contacts, "contextual"))
     return [item for item in result if item is not None]
+
+
+def warmup_result() -> dict[str, Any]:
+    initialise_models()
+    return {
+        "warmup": True,
+        "processingVersion": PROCESSING_VERSION,
+        "modelVersions": {
+            "pose": POSE_MODEL_PATH.name if MODELS.pose else "unavailable",
+            "shuttle": SHUTTLE_MODEL_PATH.name if MODELS.shuttle else "unavailable",
+            "racket": RACKET_MODEL_PATH.name if MODELS.racket else "unavailable",
+        },
+        "warnings": MODELS.warnings[:8],
+    }
 
 
 def handler(job: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     data = job.get("input", {})
     try:
+        if data.get("warmup"):
+            return warmup_result()
         validate_job(data)
         initialise_models()
+        court_type = data.get("courtType", "singles")
+        width_m = court_width_m(court_type)
         timings = {"download": 0.0, "decode": 0.0, "inference": 0.0, "render": 0.0, "total": 0.0}
         warnings = list(MODELS.warnings)
         requested = set(data["requestedLayers"])
@@ -308,12 +368,15 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("source video is missing readable frame metadata")
             duration = frame_count / source_fps
             if duration > MAX_VIDEO_SECONDS:
-                raise ValueError(f"source video is {duration:.1f}s; the worker limit is {MAX_VIDEO_SECONDS:.0f}s")
-            sample_fps = min(DEFAULT_SAMPLE_FPS, source_fps)
-            stride = max(1, round(source_fps / sample_fps))
+                raise ValueError(f"source video is {duration:.1f}s; upload a rally or drill up to {MAX_VIDEO_SECONDS:.0f}s")
+            pose_fps = min(POSE_SAMPLE_FPS, source_fps)
+            shuttle_fps = min(SHUTTLE_SAMPLE_FPS, source_fps)
+            pose_stride = max(1, round(source_fps / pose_fps))
+            shuttle_stride = max(1, round(source_fps / shuttle_fps))
             selector = PlayerSelector(data["selectedPlayer"], math.hypot(width, height))
             shuttle_tracker = ShuttleTracker()
             overlays, samples = [], []
+            shuttle_obs, racket_obs = [], []
             pose_detected = shuttle_detected = 0
             usable = sampled = 0
             homography: np.ndarray | None = None
@@ -328,13 +391,12 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     break
                 if first_frame is None:
                     first_frame = frame.copy()
-                    # Validate geometry even when the customer did not request
-                    # a court overlay. Otherwise a stale client-side
-                    # “validated” flag could leak into coaching claims.
-                    homography, accepted_calibration, line_support = calibration_homography(data["calibration"], first_frame)
+                    homography, accepted_calibration, line_support = calibration_homography(data["calibration"], first_frame, court_type)
                     if homography is None:
                         warnings.append(accepted_calibration["guidance"])
-                if frame_index % stride:
+                run_pose = frame_index % pose_stride == 0
+                run_shuttle = frame_index % shuttle_stride == 0
+                if not run_pose and not run_shuttle:
                     frame_index += 1
                     continue
                 sampled += 1
@@ -342,7 +404,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 overlay: dict[str, Any] = {"timeMs": time_ms}
                 errors: dict[str, str] = {}
                 infer_start = time.perf_counter()
-                selected = selector.select(pose_candidates(frame)) if "skeleton" in requested else None
+                selected = selector.select(pose_candidates(frame)) if run_pose and "skeleton" in requested else None
+                shuttle_candidates = object_candidates(MODELS.shuttle, frame) if run_shuttle and "shuttle" in requested else []
+                racket_candidates = object_candidates(MODELS.racket, frame) if run_shuttle and "racket" in requested else []
                 timings["inference"] += elapsed(infer_start)
                 foot: np.ndarray | None = None
                 if selected is not None:
@@ -351,30 +415,31 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     if pose_confidence >= MIN_CONFIDENCE:
                         overlay["skeleton"] = [normalise_point(point, width, height, float(score)) for point, score in zip(keypoints[:17], scores[:17])]
                         foot = keypoints[15] if scores[15] >= scores[16] else keypoints[16]
-                        court = project_to_court(foot, homography)
+                        court = project_to_court(foot, homography, width_m)
                         if court is not None:
-                            overlay["courtPosition"] = {"x": round(float(court[0] / 6.1 * 100), 3), "y": round(float(court[1] / 13.4 * 100), 3), "confidence": round(pose_confidence, 3)}
-                        samples.append({"frame": frame_index, "timeMs": time_ms, "keypoints": keypoints, "scores": scores, "confidence": pose_confidence, "court": court})
+                            overlay["courtPosition"] = {"x": round(float(court[0] / width_m * 100), 3), "y": round(float(court[1] / COURT_LENGTH_M * 100), 3), "confidence": round(pose_confidence, 3)}
+                        samples.append({"frame": frame_index, "timeMs": time_ms, "keypoints": keypoints, "scores": scores, "confidence": pose_confidence, "court": court, "xy": foot})
                         pose_detected += 1
                         usable += 1
                     else:
                         errors["Skeleton"] = "Pose confidence was below the analysis threshold."
-                elif "skeleton" in requested:
+                elif run_pose and "skeleton" in requested:
                     errors["Skeleton"] = "Selected player was not confidently tracked in this frame."
-                if "shuttle" in requested:
-                    candidates = [(point, confidence) for point, confidence, _ in object_candidates(MODELS.shuttle, frame)]
-                    shuttle = shuttle_tracker.pick(candidates, math.hypot(width, height))
+                if run_shuttle and "shuttle" in requested:
+                    shuttle = shuttle_tracker.pick([(point, confidence) for point, confidence, _ in shuttle_candidates], math.hypot(width, height))
                     if shuttle is not None:
                         point, confidence = shuttle
                         overlay["shuttle"] = normalise_point(point, width, height, confidence)
+                        shuttle_court = project_to_court(point, homography, width_m)
+                        shuttle_obs.append({"frame": frame_index, "timeMs": time_ms, "xy": point, "court": shuttle_court, "confidence": confidence})
                         shuttle_detected += 1
                     else:
                         errors["Shuttle"] = "Shuttlecock was not confidently detected or temporally consistent."
-                if "racket" in requested:
-                    rackets = object_candidates(MODELS.racket, frame)
-                    if rackets:
-                        point, confidence, box = max(rackets, key=lambda item: item[1])
+                if run_shuttle and "racket" in requested:
+                    if racket_candidates:
+                        point, confidence, box = max(racket_candidates, key=lambda item: item[1])
                         overlay["racket"] = {"grip": normalise_point(np.array([box[0], box[3]]), width, height, confidence), "head": normalise_point(point, width, height, confidence)}
+                        racket_obs.append({"frame": frame_index, "timeMs": time_ms, "xy": point, "confidence": confidence})
                     else:
                         errors["Racket"] = "Racket model is unavailable or the racket is occluded."
                 if "courtMap" in requested and homography is None:
@@ -390,23 +455,40 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         if MODELS.pose is None and "skeleton" in requested:
             warnings.append("No pose model was installed; no technique or movement metrics were created.")
         if MODELS.shuttle is None and "shuttle" in requested:
-            warnings.append("No shuttlecock model was installed; no contact, trajectory, or shot labels were created.")
+            warnings.append("No shuttlecock model was installed; contact, trajectory, and shot labels were withheld.")
         if MODELS.racket is None and "racket" in requested:
-            warnings.append("No racket model was installed; racket-path and contact metrics were withheld.")
+            warnings.append("No racket model was installed; racket-path evidence was withheld.")
         if line_support is not None:
-            warnings.append(f"Court-line support score: {line_support:.2f} (threshold 0.42).")
+            warnings.append(f"Court-line support score: {line_support:.2f} (threshold 0.42) on a {court_type} court.")
+        events = build_event_layer(shuttle_obs, samples, racket_obs, math.hypot(width, height), court_type, data["selectedPlayer"], homography is not None)
+        warnings.extend(capture_warnings(source_fps, duration, shuttle_detected / max(sampled, 1), usable / max(sampled, 1)))
+        if not events["shotDistribution"]:
+            warnings.append("No verified stroke labels were produced. Contacts without a confident post-impact shuttle track stay unverified.")
+        if "racket" in requested and not [item for item in events["events"] if item["type"] == "racket_swing"]:
+            warnings.append("No racket swing was detected near any contact. The racket was occluded, slow, or the model layer is not reliable on this view.")
         timings["total"] = elapsed(started)
         return {
-            "processingVersion": os.environ.get("PROCESSING_VERSION", "omnicourt-badminton-worker-1.0.0"),
+            "processingVersion": PROCESSING_VERSION,
             "calibration": accepted_calibration,
+            "courtType": court_type,
             "quality": {"usableFrameRatio": round(usable / max(sampled, 1), 3), "poseTrackConfidence": round(float(np.mean([sample["confidence"] for sample in samples])) if samples else 0, 3), "shuttleTrackConfidence": round(shuttle_detected / max(sampled, 1), 3)},
-            "metrics": calculate_metrics(samples, homography is not None),
-            # Stroke recognition is intentionally empty unless a separately
-            # evaluated temporal classifier and verified contact evidence are
-            # installed. Heuristics are not a substitute for badminton labels.
-            "shotDistribution": {},
+            "metrics": [*calculate_metrics(samples, homography is not None, events["events"]), *events["metrics"]],
+            "shotDistribution": events["shotDistribution"],
+            "events": events["events"][:240],
+            "rallies": events["rallies"][:48],
+            "shots": events["shots"][:240],
             "overlays": overlays,
-            "diagnostics": {"sampledFrames": sampled, "sourceFps": round(source_fps, 3), "sampleFps": round(sample_fps, 3), "timingsMs": timings, "modelVersions": {"pose": POSE_MODEL_PATH.name if MODELS.pose else "unavailable", "shuttle": SHUTTLE_MODEL_PATH.name if MODELS.shuttle else "unavailable", "racket": RACKET_MODEL_PATH.name if MODELS.racket else "unavailable"}, "warnings": warnings[:32]},
+            "diagnostics": {
+                "sampledFrames": sampled,
+                "sourceFps": round(source_fps, 3),
+                "sampleFps": round(shuttle_fps, 3),
+                "poseSampleFps": round(pose_fps, 3),
+                "shuttleSampleFps": round(shuttle_fps, 3),
+                "racketSampleFps": round(shuttle_fps, 3),
+                "timingsMs": timings,
+                "modelVersions": {"pose": POSE_MODEL_PATH.name if MODELS.pose else "unavailable", "shuttle": SHUTTLE_MODEL_PATH.name if MODELS.shuttle else "unavailable", "racket": RACKET_MODEL_PATH.name if MODELS.racket else "unavailable"},
+                "warnings": warnings[:32],
+            },
         }
     except Exception as exc:
         return error(str(exc)[:500])
@@ -414,4 +496,4 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
 if __name__ == "__main__":
     initialise_models()
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": handler, "concurrency": HANDLER_CONCURRENCY})

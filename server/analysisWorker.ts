@@ -8,6 +8,7 @@ export type WorkerJobRequest = {
   /** Short-lived, read-only URL. Workers must never receive storage credentials. */
   sourceVideoUrl: string;
   selectedPlayer: "near" | "far";
+  courtType?: "singles" | "doubles";
   calibration: Calibration;
   requestedLayers: Array<"skeleton" | "shuttle" | "racket" | "courtMap">;
 };
@@ -210,4 +211,81 @@ export function validateWorkerResult(result: AnalysisResult) {
     throw new Error(`Worker result validation failed: ${parsed.error.issues[0]?.message ?? "invalid result"}`);
   }
   return parsed.data as AnalysisResult;
+}
+
+function warmupCooldownMs(): number {
+  return Number(process.env.CV_WORKER_WARMUP_COOLDOWN_MS ?? 60_000);
+}
+
+let lastWarmupAcceptedAt = 0;
+
+/**
+ * Throttles warmup jobs so repeated video selections never spam the GPU
+ * endpoint inside one cooldown window. The keep-warm scheduler and the
+ * predictive client warmup share this gate so warm workers stay warm without
+ * paying for redundant jobs.
+ */
+export function workerWarmupCooldownMs(): number {
+  return warmupCooldownMs();
+}
+
+export function resetWorkerWarmupCooldown() {
+  lastWarmupAcceptedAt = 0;
+}
+
+export type WarmupResult = {
+  jobId: string;
+  accepted: boolean;
+  throttled: boolean;
+  retryInMs?: number;
+};
+
+export async function submitWorkerWarmup(opts?: { force?: boolean }): Promise<WarmupResult> {
+  const now = Date.now();
+  const cooldownMs = warmupCooldownMs();
+  const elapsedSinceAccepted = now - lastWarmupAcceptedAt;
+  if (!opts?.force && elapsedSinceAccepted < cooldownMs) {
+    return {
+      jobId: "warmup",
+      accepted: false as const,
+      throttled: true as const,
+      retryInMs: Math.max(0, cooldownMs - elapsedSinceAccepted),
+    };
+  }
+  const workerUrl = process.env.CV_WORKER_URL;
+  if (!workerUrl) throw new Error("No production computer-vision worker has been configured.");
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (process.env.CV_WORKER_TOKEN) headers.Authorization = `Bearer ${process.env.CV_WORKER_TOKEN}`;
+
+  if (isRunpodEndpoint(workerUrl)) {
+    const endpoint = `${runpodRoot(workerUrl)}/run`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        input: { warmup: true },
+        policy: {
+          executionTimeout: Number(process.env.CV_WORKER_WARMUP_TIMEOUT_MS ?? 120_000),
+          ttl: Number(process.env.CV_WORKER_WARMUP_TTL_MS ?? 180_000),
+        },
+      }),
+    });
+    if (!response.ok) {
+      const detail = await responseDetail(response);
+      throw new Error(`RunPod warmup was rejected (${response.status}).${detail ? ` Response: ${detail}` : ""}`);
+    }
+    const body = (await response.json()) as { id?: unknown };
+    if (typeof body.id !== "string") throw new Error("RunPod returned an invalid warmup job response.");
+    lastWarmupAcceptedAt = Date.now();
+    return { jobId: body.id, accepted: true as const, throttled: false as const };
+  }
+
+  const endpoint = `${workerUrl.replace(/\/$/, "")}/v1/warmup`;
+  const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ warmup: true }) });
+  if (!response.ok) {
+    throw new Error(workerEndpointHint(response.status, "/v1/warmup", await responseDetail(response)));
+  }
+  lastWarmupAcceptedAt = Date.now();
+  return { jobId: "warmup", accepted: true as const, throttled: false as const };
 }
