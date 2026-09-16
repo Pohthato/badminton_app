@@ -11,6 +11,7 @@ import { serveStatic, setupVite } from "./vite";
 import crypto from "node:crypto";
 import { reconcileAnalysisWorkerJob } from "../analysisCompletion";
 import { getWorkerCallbackToken } from "../analysisWorker";
+import { startKeepWarmScheduler } from "../warmupScheduler";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -32,6 +33,9 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 }
 
 async function startServer() {
+  // Keep one serverless GPU warm (when configured) so the first analysis of a
+  // product-hour skips the multi-minute cold start.
+  startKeepWarmScheduler();
   const app = express();
   const server = createServer(app);
   // Configure body parser with larger size limit for file uploads

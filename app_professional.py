@@ -23,10 +23,11 @@ from typing import Dict, List, Optional
 from professional_court_detector import ProfessionalCourtHomography
 from advanced_player_analyzer import AdvancedPlayerAnalyzer
 from live_video_analyzer import LiveVideoAnalyzer
-from shuttlecock_detector import detect_shuttlecocks
+from shuttlecock_detector import detect_shuttlecocks, detect_shuttle_keypoints, init_shuttle_detector
 from pose_tracker import MultiPoseTracker
 from visualization_utils import draw_skeleton
 from data_processing import apply_nms, center_distance, filter_close_detections
+from world_class_analyzer import WorldClassAnalyzer
 
 load_dotenv()
 
@@ -67,6 +68,8 @@ court_homography = ProfessionalCourtHomography()
 detected_players = {}
 player_analyzers = {}  # Per-player analyzers
 live_analyzer = None
+world_class_analyzer = None
+world_class_results = {}
 
 
 def init_yolo():
@@ -88,6 +91,11 @@ def init_yolo():
             yolo_model = False
     
     return yolo_model
+
+
+def init_shuttle():
+    """Initialize world-class shuttlecock detector with best.pt."""
+    return init_shuttle_detector()
 
 
 def init_pose_model():
@@ -440,21 +448,276 @@ def health():
 
 
 # ============================================================
-# MAIN
+# STAGE 2: First Frame with Skeleton Detection
 # ============================================================
+
+@app.route("/api/first-frame", methods=["POST"])
+def get_first_frame():
+    """Extract first frame with skeleton detection for player selection."""
+    global current_video_path
+    
+    if current_video_path is None:
+        return jsonify({"error": "No video loaded"}), 400
+    
+    cap = cv2.VideoCapture(current_video_path)
+    if not cap.isOpened():
+        return jsonify({"error": "Cannot open video"}), 400
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if not ret:
+        return jsonify({"error": "Cannot read frame"}), 400
+    
+    init_pose_model()
+    if not pose_model or pose_model is False:
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return jsonify({"success": True, "frame": base64.b64encode(buffer).decode('utf-8'),
+                       "frame_width": frame.shape[1], "frame_height": frame.shape[0],
+                       "players": [], "player_count": 0})
+    
+    try:
+        results = pose_model(frame, conf=0.25, verbose=False)
+        players = []
+        if results and len(results) > 0:
+            result = results[0]
+            if result.keypoints is not None and len(result.keypoints) > 0:
+                kpts = result.keypoints.data.cpu().numpy()
+                boxes = result.boxes.xyxy.cpu().numpy() if result.boxes else None
+                scores = result.boxes.conf.cpu().numpy() if result.boxes else None
+                for i in range(len(kpts)):
+                    keypoints = kpts[i][:, :2].tolist()
+                    kpt_scores = kpts[i][:, 2].tolist()
+                    box = boxes[i].tolist() if boxes is not None and i < len(boxes) else [0,0,0,0]
+                    score = float(scores[i]) if scores is not None and i < len(scores) else 0.0
+                    cx = float(np.mean([kp[0] for kp in keypoints if kp[0] > 0]) if any(kp[0] > 0 for kp in keypoints) else 0)
+                    cy = float(np.mean([kp[1] for kp in keypoints if kp[1] > 0]) if any(kp[1] > 0 for kp in keypoints) else 0)
+                    players.append({"id": i, "keypoints": keypoints, "keypoint_scores": kpt_scores,
+                                   "box": box, "score": score, "center_x": cx, "center_y": cy})
+        
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+        return jsonify({"success": True, "frame": frame_base64, "frame_width": frame.shape[1],
+                       "frame_height": frame.shape[0], "players": players, "player_count": len(players)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# STAGE 3: Court Calibration
+# ============================================================
+
+@app.route("/api/set-court-corners", methods=["POST"])
+def set_court_corners():
+    """Set court corners and compute homography."""
+    global court_homography
+    
+    data = request.get_json()
+    if not data or "corners" not in data:
+        return jsonify({"error": "No corners provided"}), 400
+    
+    corners = data["corners"]
+    if len(corners) < 3:
+        return jsonify({"error": "At least 3 corners required"}), 400
+    
+    try:
+        src_points = np.array([[c["x"], c["y"]] for c in corners], dtype=np.float32)
+        
+        court_length = 13.4
+        court_width = 6.1
+        
+        if len(src_points) == 3:
+            angles = []
+            for i in range(3):
+                others = [j for j in range(3) if j != i]
+                v1 = src_points[others[0]] - src_points[i]
+                v2 = src_points[others[1]] - src_points[i]
+                cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+                angles.append(np.arccos(np.clip(cos_a, -1, 1)))
+            shared_idx = int(np.argmax(angles))
+            shared = src_points[shared_idx]
+            others = np.array([src_points[i] for i in range(3) if i != shared_idx])
+            fourth = others[0] + others[1] - shared
+            src_full = np.zeros((4, 2), dtype=np.float32)
+            src_full[:3] = src_points
+            src_full[3] = fourth
+            src_points = src_full
+        
+        # Sort corners
+        src_points = sort_corners(src_points)
+        
+        success = court_homography.set_manual_corners(src_points.tolist())
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "homography": True,
+                "corners": court_homography.court_corners_px.tolist() if court_homography.court_corners_px is not None else None,
+                "court_dimensions": {"width_m": court_width, "length_m": court_length},
+                "diagnostics": court_homography.get_court_diagnostics()
+            })
+        return jsonify({"error": "Failed to compute homography"}), 500
+    except Exception as e:
+        logger.error(f"Court calibration failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def sort_corners(corners):
+    """Sort corners to: top-left, top-right, bottom-right, bottom-left."""
+    if len(corners) < 4:
+        return corners
+    sorted_by_y = sorted(corners, key=lambda p: p[1])
+    top_two = sorted(sorted_by_y[:2], key=lambda p: p[0])
+    bottom_two = sorted(sorted_by_y[2:], key=lambda p: p[0])
+    return np.array([top_two[0], top_two[1], bottom_two[1], bottom_two[0]], dtype=np.float32)
+
+
+# ============================================================
+# STAGE 4: World-Class Analysis
+# ============================================================
+
+@app.route("/api/analyze-player", methods=["POST"])
+def analyze_player():
+    """Run world-class analysis on selected player."""
+    global current_video_path, court_homography, world_class_analyzer, world_class_results
+    
+    if current_video_path is None:
+        return jsonify({"error": "No video loaded"}), 400
+    
+    data = request.get_json()
+    if not data or "player_id" not in data:
+        return jsonify({"error": "No player_id provided"}), 400
+    
+    player_id = data["player_id"]
+    
+    try:
+        cap = cv2.VideoCapture(current_video_path)
+        if not cap.isOpened():
+            return jsonify({"error": "Cannot open video"}), 400
+        
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        world_class_analyzer = WorldClassAnalyzer(court_homography)
+        world_class_analyzer.set_fps(fps)
+        init_shuttle()
+        init_pose_model()
+        
+        if not pose_model or pose_model is False:
+            cap.release()
+            return jsonify({"error": "Pose model not available"}), 500
+        
+        frame_count = 0
+        skip = data.get("skip_frames", 2)
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            if frame_count % (skip + 1) != 0:
+                frame_count += 1
+                continue
+            
+            timestamp = frame_count / fps
+            pose_results = pose_model(frame, conf=0.25, verbose=False)
+            shuttle_detections = detect_shuttle_keypoints(frame, conf_threshold=0.15)
+            
+            if pose_results and len(pose_results) > 0:
+                result = pose_results[0]
+                if result.keypoints is not None and len(result.keypoints) > 0:
+                    kpts = result.keypoints.data.cpu().numpy()
+                    boxes = result.boxes.xyxy.cpu().numpy() if result.boxes else None
+                    
+                    if len(kpts) > player_id:
+                        player_kps = kpts[player_id][:, :2].tolist()
+                        player_scores = kpts[player_id][:, 2].tolist()
+                        box = boxes[player_id].tolist() if boxes is not None and player_id < len(boxes) else [0,0,0,0]
+                        
+                        world_class_analyzer.analyze_frame(
+                            player_kps, player_scores,
+                            shuttle_detections, box, frame_count, timestamp)
+            
+            frame_count += 1
+        
+        cap.release()
+        report = world_class_analyzer.generate_comprehensive_report()
+        world_class_results = report
+        
+        return jsonify({
+            "success": True, "report": report,
+            "video_info": {"fps": fps, "total_frames": total_frames,
+                          "width": width, "height": height,
+                          "duration": total_frames / fps if fps > 0 else 0}
+        })
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/report", methods=["GET"])
+def get_report():
+    if not world_class_results:
+        return jsonify({"error": "No analysis results"}), 404
+    return jsonify({"success": True, "report": world_class_results})
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify({"error": "No message"}), 400
+    msg = data["message"]
+    try:
+        from llm_feedback import generate_chat_reply
+        ctx = {"profile": {}, "feedback": {}, "pose_metrics": {}, "box_metrics": {}}
+        if world_class_results:
+            ctx["profile"] = {"posture": "good" if world_class_results.get("technical_scores", {}).get("posture", 0) > 0.6 else "needs work",
+                          "balance": "good" if world_class_results.get("technical_scores", {}).get("balance", 0) > 0.6 else "needs work",
+                          "stance": "athletic"}
+            ctx["feedback"] = {"strengths": world_class_results.get("strengths", []),
+                              "weaknesses": world_class_results.get("weaknesses", []),
+                              "drills": world_class_results.get("drills", [])}
+        reply = generate_chat_reply("player", msg, ctx)
+        if reply:
+            return jsonify({"success": True, "reply": reply})
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+    return jsonify({"success": True, "reply": _fallback_chat(msg, world_class_results)})
+
+
+def _fallback_chat(message, results):
+    if not results:
+        return "Please analyze a video first."
+    msg = message.lower()
+    if "strength" in msg:
+        s = results.get("strengths", [])
+        return f"Your strengths: {"; ".join(s[:3])}" if s else "Your fundamentals are solid."
+    if "weak" in msg or "improve" in msg:
+        w = results.get("weaknesses", [])
+        return f"Areas to improve: {"; ".join(w[:3])}" if w else "Focus on consistency."
+    if "shot" in msg or "stroke" in msg:
+        st = results.get("stroke_analysis", {})
+        d = st.get("distribution", {})
+        if d:
+            mc = max(d, key=d.get)
+            return f"Most common shot: {mc} ({d[mc]} times)"
+        return "Work on developing a wider range of shots."
+    if "drill" in msg or "practice" in msg:
+        dr = results.get("drills", [])
+        return f"Drills: {"; ".join(dr[:3])}" if dr else "Practice shadow badminton daily."
+    if "score" in msg:
+        sc = results.get("technical_scores", {})
+        return f"Overall score: {sc.get("overall", 0):.0%}"
+    return f"Session: {results.get("session_summary", {}).get("total_strokes", 0)} strokes. Ask about strengths, weaknesses, shots, or drills."
+
 
 if __name__ == "__main__":
     logger.info("Starting OmniCourt Professional Server...")
-    logger.info(f"CUDA Available: {torch.cuda.is_available()}")
-    
-    # Initialize models
+    logger.info(f"CUDA: {torch.cuda.is_available()}")
     init_yolo()
     init_pose_model()
-    
-    # Run server
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-        threaded=True
-    )
+    init_shuttle()
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

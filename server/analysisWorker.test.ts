@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getAnalysisWorkerJob,
+  resetWorkerWarmupCooldown,
   submitAnalysisWorkerJob,
+  submitWorkerWarmup,
   validateWorkerResult,
+  workerWarmupCooldownMs,
 } from "./analysisWorker";
 
 const request = {
@@ -263,5 +266,77 @@ describe("analysis worker handoff", () => {
       "https://worker.example.test/v1/analysis-jobs",
       expect.objectContaining({ method: "POST" })
     );
+  });
+});
+
+describe("worker warmup throttle", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    resetWorkerWarmupCooldown();
+  });
+
+  it("starts with an accepted RunPod warmup job", async () => {
+    vi.stubEnv("CV_WORKER_URL", "https://api.runpod.ai/v2/endpoint-1");
+    vi.stubEnv("CV_WORKER_TOKEN", "runpod-test-key");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ id: "warmup-1", status: "IN_QUEUE" }), { status: 200 })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(submitWorkerWarmup()).resolves.toEqual({
+      jobId: "warmup-1",
+      accepted: true,
+      throttled: false,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.runpod.ai/v2/endpoint-1/run",
+      expect.objectContaining({ method: "POST" })
+    );
+  });
+
+  it("throttles repeated warmup jobs inside the cooldown window", async () => {
+    vi.stubEnv("CV_WORKER_URL", "https://api.runpod.ai/v2/endpoint-1");
+    vi.stubEnv("CV_WORKER_TOKEN", "runpod-test-key");
+    vi.stubEnv("CV_WORKER_WARMUP_COOLDOWN_MS", "60000");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(JSON.stringify({ id: "warmup-1", status: "IN_QUEUE" }), { status: 200 })
+        )
+    );
+
+    const first = await submitWorkerWarmup();
+    expect(first.accepted).toBe(true);
+
+    const second = await submitWorkerWarmup();
+    expect(second.accepted).toBe(false);
+    expect(second.throttled).toBe(true);
+    expect(second.retryInMs).toBeGreaterThan(0);
+  });
+
+  it("force bypasses the throttle so the keep-warm scheduler is never blocked", async () => {
+    vi.stubEnv("CV_WORKER_URL", "https://api.runpod.ai/v2/endpoint-1");
+    vi.stubEnv("CV_WORKER_TOKEN", "runpod-test-key");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() =>
+        new Response(JSON.stringify({ id: "warmup-1", status: "IN_QUEUE" }), { status: 200 })
+      )
+    );
+
+    await submitWorkerWarmup();
+    const forced = await submitWorkerWarmup({ force: true });
+    expect(forced.accepted).toBe(true);
+    expect(forced.throttled).toBe(false);
+  });
+
+  it("exposes the cooldown duration from configuration", () => {
+    vi.stubEnv("CV_WORKER_WARMUP_COOLDOWN_MS", "45000");
+    expect(workerWarmupCooldownMs()).toBe(45_000);
   });
 });

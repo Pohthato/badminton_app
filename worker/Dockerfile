@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MODEL_DIR=/opt/omnicourt/models
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 libgl1 && rm -rf /var/lib/apt/lists/*
 COPY worker/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
-COPY worker/handler.py /opt/omnicourt/handler.py
+COPY worker/handler.py worker/badminton.py /opt/omnicourt/
 COPY worker/weights/ /opt/omnicourt/models/
 
 # Fail the image build only when a deliberate production build verifies its

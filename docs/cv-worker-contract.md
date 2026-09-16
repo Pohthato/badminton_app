@@ -28,7 +28,9 @@ The worker returns `queued`, `processing`, `completed`, or `failed`. A completed
 | Court registration | Labelled lines/keypoints, homography, reprojection error, camera-pose status | Court-plane metrics require accepted registration; partial calibration cannot be shown as exact metres. |
 | Pose inference | Temporal 17-keypoint skeletons, per-keypoint confidence, player identity track | Only skeleton strokes are rendered; persistent person boxes are prohibited in the review layer. |
 | Shuttle and racket tracking | Detector output plus temporal filter state and confidence | Gaps, occlusions, and uncertainty remain visible to the user rather than being silently filled. |
-| Biomechanics | Frame evidence for every aggregate metric | Coaching prompts receive confidence-gated metrics and source timestamps only. |
+| Events | `contact`, `split_step`, `recovery_complete`, `racket_swing` with frame, timeMs, confidence, source | Coaching prompts receive confidence-gated events and source timestamps only. |
+| Biomechanics | Frame evidence for every aggregate metric: base width, knee flexion angle, split-step timing, recovery, court coverage, split-step amplitude, racket swing speed | Split-step amplitude and racket swing speed are image-relative (normalised by frame diagonal), not calibrated physical speeds. |
+| Shots | Verified shot only when contact plus a post-impact track clears the gate; each shot carries direction, depth, `landingSide` (`own_half`/`opponent_half`/`unclear`) | Landing side is derived from the observed post-impact shuttle cloud beyond the net centre-line, never an interpolated bounce. |
 | Artifact rendering | Annotated MP4 and/or normalized overlays | The review canvas switches to verified overlays only when the worker returns a completed result. |
 
 ## Deployment boundary

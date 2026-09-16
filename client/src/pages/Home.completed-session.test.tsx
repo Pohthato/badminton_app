@@ -21,6 +21,7 @@ vi.mock("@/lib/trpc", () => {
       analysis: {
         createDraft: { useMutation: mutation },
         submit: { useMutation: mutation },
+        warmupGpu: { useMutation: mutation },
         refresh: { useMutation: mutation },
         get: { useQuery: () => ({ data: completedSession, refetch: vi.fn() }) },
       },
